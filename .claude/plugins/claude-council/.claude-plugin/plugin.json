@@ -1,0 +1,23 @@
+{
+  "name": "claude-council",
+  "version": "2026.8.2",
+  "description": "Consult multiple AI coding agents (Gemini, OpenAI, Grok, Perplexity, Kimi, plus codex, antigravity, grok and kimi CLIs when installed, and a local ollama model) to get diverse perspectives on coding problems",
+  "author": {
+    "name": "hex",
+    "url": "https://github.com/hex"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/hex/claude-council",
+  "repository": "https://github.com/hex/claude-council",
+  "keywords": [
+    "multi-agent",
+    "council",
+    "gemini",
+    "openai",
+    "grok",
+    "perplexity",
+    "codex",
+    "cli",
+    "perspectives"
+  ]
+}

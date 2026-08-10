@@ -1,0 +1,557 @@
+# Architecture
+
+## System Overview
+
+```
+                           USER REQUEST
+                                |
+                                v
+                    +------------------------+
+                    |   /claude-council:ask  |
+                    |     (commands/ask.md)  |
+                    +------------------------+
+                                |
+                                v
++------------------------------------------------------------------------+
+|                        query-council.sh                                 |
+|------------------------------------------------------------------------|
+|  1. Parse Arguments (--providers, --roles, --debate, --file, etc.)     |
+|  2. Discover Available Providers (API key OR CLI binary on PATH)       |
+|  3. Apply CLI-prefers-API policy (codex shadows openai, etc.)          |
+|  4. Resolve Roles (expand presets, assign to providers)                |
+|  5. Build Context (--file content, auto-context detection)             |
++------------------------------------------------------------------------+
+                                |
+                                v
+                    +------------------------+
+                    |     ROUND 1: Query     |
+                    +------------------------+
+                                |
+        +-------+-------+-------+-------+-------+-------+
+        |       |       |       |       |       |       |
+        v       v       v       v       v       v       v
+   +--------+ +-----+ +------+ +-----+ +------+ +-----------+ +---------+
+   | gemini | |open | | grok | |perp | | kimi | |  codex    | | anti-   |
+   |  .sh   | | .sh | |  .sh | |.sh  | |  .sh | |   .sh     | |grav .sh |
+   +--------+ +-----+ +------+ +-----+ +------+ +-----------+ +---------+
+   (API)      (API)   (API)    (API)   (API)    (CLI)         (CLI)
+
+                    +----------+ +----------+ +----------+
+                    | grok-cli | | kimi-cli | |  ollama  |
+                    |   .sh    | |   .sh    | |   .sh    |
+                    +----------+ +----------+ +----------+
+                    (CLI)        (CLI)        (local)
+        |               |               |               |
+        |    +----------+----------+----------+        |
+        +--->|      lib/cache.sh   |<---------+--------+
+             | (check/store cache) |
+             +---------------------+
+                      |
+        +-------------+-------------+
+        |             |             |
+        v             v             v
+   [CACHE HIT]   [CACHE MISS]   [ERROR]
+        |             |             |
+        |             v             |
+        |      +-------------+      |
+        |      | lib/retry.sh|      |
+        |      | (exp backoff|      |
+        |      |  429/5xx)   |      |
+        |      +-------------+      |
+        |             |             |
+        +------+------+------+------+
+               |
+               v
+    +---------------------+
+    | Collect R1 Results  |
+    | {provider: {status, |
+    |   response, cached, |
+    |   role, model}}     |
+    +---------------------+
+               |
+               +------ [if --debate] ------+
+               |                           |
+               v                           v
+    +-------------------+       +------------------------+
+    | Output R1 Results |       |   ROUND 2: Rebuttals   |
+    +-------------------+       +------------------------+
+                                           |
+                        +------------------+------------------+
+                        |                  |                  |
+                        v                  v                  v
+                  +-----------+      +-----------+      +-----------+
+                  | Provider A|      | Provider B|      | Provider C|
+                  | sees B,C  |      | sees A,C  |      | sees A,B  |
+                  | responses |      | responses |      | responses |
+                  +-----------+      +-----------+      +-----------+
+                        |                  |                  |
+                        +--------+---------+--------+---------+
+                                 |
+                                 v
+                      +---------------------+
+                      | Collect R2 Results  |
+                      +---------------------+
+                                 |
+               +-----------------+
+               |
+               v
+    +---------------------+
+    |   Build JSON Output |
+    |---------------------|
+    | {                   |
+    |   metadata: {...},  |
+    |   round1: {...},    |
+    |   round2: {...}     |  <-- only if debate
+    | }                   |
+    +---------------------+
+               |
+               v
+    +---------------------+
+    | format-output.sh    |
+    | (terminal display)  |
+    +---------------------+
+               |
+               v
+    +---------------------+
+    | lib/export.sh       |  <-- if --output
+    | (markdown file)     |
+    +---------------------+
+```
+
+## Component Details
+
+### Provider Scripts (`scripts/providers/*.sh`)
+
+Each provider follows a consistent interface:
+
+```
+INPUT:  --prompt-file <path>  the prompt; the orchestrator always uses this so a
+                              large prompt stays off the argv (see ARG_MAX below)
+        --image-file <path>   base64 image, passed only to vision-capable providers
+        --image-mime <type>   the image's MIME type (pairs with --image-file)
+        $1                    a literal prompt, for direct/manual invocation
+OUTPUT: stdout = AI response text
+EXIT:   0 = success, non-zero = failure (error to stderr)
+        3 = the requested model is unavailable for this key/region — the
+            orchestrator's model-fallback wrapper retries with a fallback
+            model instead of surfacing the error (see Model Fallback below)
+```
+
+Two flavors share the interface:
+
+- **API providers** (`gemini`, `openai`, `grok`, `perplexity`, `kimi`), gated on
+  `{PROVIDER}_API_KEY`, talk to vendor APIs over HTTPS, charge per call.
+- **CLI providers** (`codex`, `antigravity`, `grok-cli`, `kimi-cli`), gated on the
+  binary being on `PATH`, use the user's existing CLI subscription auth, no per-call
+  cost. When both an API and CLI sibling exist (codex+openai, antigravity+gemini,
+  grok-cli+grok, kimi-cli+kimi), the orchestrator prefers the CLI by default; explicit
+  `--providers` wins over the policy. If a CLI provider fails at query time, the
+  council retries through its API sibling (when that key is set) and marks the
+  slot as a fallback.
+- **`ollama`**, also gated on the binary being on `PATH`, but local and keyless:
+  it shadows nothing, has no API sibling, and costs nothing per call.
+
+Environment-based configuration:
+- `{PROVIDER}_API_KEY` - Required authentication for API providers
+- `{PROVIDER}_MODEL` - Model override (also applies to CLI providers via
+  `CODEX_MODEL` / `ANTIGRAVITY_MODEL` / `GROK_CLI_MODEL` / `KIMI_CLI_MODEL`)
+- `COUNCIL_MAX_TOKENS` - Response length limit (API providers only; `ollama`
+  raises its own base to 4096)
+- `COUNCIL_DEBUG` - Enable verbose logging
+
+### Vision / Image Input (`--image`)
+
+A single image can be attached with `--image=path` (png/jpg/jpeg/webp/gif,
+≤10 MB). `query-council.sh` validates it once at the edge, base64-encodes it to a
+temp file, and folds only its SHA-256 into the cache key (`COUNCIL_IMAGE_HASH`) —
+the bytes never enter the prompt string.
+
+Per-provider disposition when an image is attached:
+- **gemini, openai, grok, perplexity** (vision-capable) receive the image —
+  gemini as an `inlineData` part, openai as `input_image` (Responses API) or
+  `image_url` (Chat Completions), grok and perplexity as an OpenAI-compatible
+  `image_url` data-URI on their `/chat/completions` endpoint.
+- **codex, antigravity, grok-cli** (CLI, cannot accept an image) route to their
+  vision API sibling, codex→openai, antigravity→gemini, grok-cli→grok, with
+  the image. The route is taken only when the sibling is itself vision-capable,
+  so **kimi-cli** does not use it: its sibling `kimi` is text-only.
+- **kimi, kimi-cli, ollama** answer text-only, prefixed with
+  `(answered without the image)`.
+
+Privacy invariant: only the image's SHA-256 keys the cache. The base64 lives
+solely in a temp file passed to providers; it is never written to cache entries
+or the saved `council-*.md` transcripts.
+
+### Cache Layer (`scripts/lib/cache.sh`)
+
+```
+Cache Key = SHA256("provider:model:verbosity:max_tokens:image_sha256:prompt")
+  (verbosity, token cap, and any attached-image hash all bust the cache, so a
+   --verbosity or --image change re-queries instead of reusing a stale answer)
+
+cache_get(key) -> response | empty
+cache_set(key, provider, model, prompt, response)
+cache_clear()
+
+Storage: $COUNCIL_CACHE_DIR/{key}.json
+TTL: $COUNCIL_CACHE_TTL seconds (default 3600)
+```
+
+### Retry Logic (`scripts/lib/retry.sh`)
+
+```
+curl_with_retry():
+  - Retries on: 429 (rate limit), 5xx (server error)
+  - Fails fast on: timeout, other 4xx (client error)
+  - Backoff: exponential (1s, 2s, 4s...)
+  - Max retries: $COUNCIL_MAX_RETRIES (default 3)
+
+curl_secret_config(header...):
+  - writes the auth header(s) to a mode-600 temp file and echoes its path
+  - callers pass it via `curl --config <file>` so API keys never ride the
+    process argv (ps-visible) or a URL query string
+```
+
+### Model Fallback (`scripts/lib/retry.sh`, `scripts/lib/model_fallback.sh`)
+
+```
+is_model_unavailable_error(body):        # retry.sh
+  - true only for a 403/404, or a 400 whose message names the model
+  - excludes 401/429/5xx: no other model fixes those
+  - reads .http_status, stamped onto every >=400 body by ensure_error_body
+    (handles xAI's bare-string .error as well as the usual .error.message)
+
+model_fallback_for(provider) -> model    # model_fallback.sh
+  - one verified fallback per API provider (openai, grok, gemini, perplexity, kimi)
+  - empty for CLI providers, which degrade to their API sibling instead, and for
+    ollama, whose models are whatever is installed locally
+
+model_unavailable_cached/remember(provider, model, key_hash):
+  - TTL-cached "unavailable" verdict, scoped to provider + preferred model + key
+  - written only once the fallback model has actually answered
+  - independent of the response cache; tunable via COUNCIL_AVAILABILITY_TTL
+```
+
+`query-council.sh`'s `run_provider_with_model_fallback` wraps a provider
+script: a preferred-model exit 3 (see Provider Scripts below), or a cached
+verdict, retries once with the fallback. The substitution is reported on the
+response header, on stderr, and folded into the synthesis prompt.
+
+### Role System (`scripts/lib/roles.sh`)
+
+```
+config/roles.json defines:
+  - Individual roles (security, performance, etc.)
+  - Role presets (balanced, security-focused, etc.)
+
+Role injection prepends instructions to prompt:
+  "As a [ROLE], focus on [CONCERNS]..."
+```
+
+### Prompt Templates (`scripts/lib/prompts.sh`, `prompts/*.md`)
+
+```
+load_prompt_template(name):  reads prompts/<name>.md
+interpolate_template(t, KEY=VALUE...): fills {{KEY}} slots
+  - unfilled slots collapse to empty
+Templates: role-injection, synthesis (calibration rules),
+           stop-review-gate (ALLOW:/BLOCK: first-line contract)
+```
+
+### Job Store (`scripts/lib/jobs.sh`)
+
+```
+State dir: $COUNCIL_JOBS_DIR, else
+           $CLAUDE_PLUGIN_DATA/jobs/<cwd-hash>, else tmp
+Per job:   <id>.json (status, pid, outfile, timestamps) + <id>.log
+Lifecycle: queued -> running -> completed | failed | cancelled
+  - run-council.sh --async re-execs itself detached as --job-worker=<id>
+  - worker exit trap converts crashes to failed
+  - --result echoes the outfile path (exit 2 while in flight)
+  - --cancel marks cancelled first, then kills the process tree
+  - jobs_prune drops oldest terminal jobs beyond COUNCIL_MAX_JOBS
+```
+
+### Output Contract (`schemas/`, `scripts/validate-analysis.sh`)
+
+```
+schemas/agent-analysis.schema.json documents the deep-execution
+agent reply shape; validate-analysis.sh enforces it with jq,
+listing every violation. Invalid replies render raw under a
+visible marker - model output is never silently dropped
+(same rule as format-output.sh's render_response).
+```
+
+### Stop Gate (`hooks/hooks.json`, `scripts/stop-review-gate.sh`)
+
+```
+Stop hook, opt-in via .claude/council-stop-gate.json.
+Reviews `git diff HEAD` through one provider using the
+stop-review-gate prompt; blocks only on first-line BLOCK:.
+Loop guards: stop_hook_active check + per-session block
+counter capped at max_iterations. Reviewer failure => allow.
+```
+
+## Data Flow
+
+### Standard Query
+
+```
+User -> parse args -> discover providers -> check cache
+                                               |
+                    +-----------+--------------+
+                    |           |
+               [HIT]         [MISS]
+                 |              |
+                 |         query API -> store cache
+                 |              |
+                 +------+-------+
+                        |
+                    format output -> display
+```
+
+### Debate Mode
+
+```
+User -> Round 1 (parallel queries)
+             |
+        collect responses
+             |
+        Round 2 (each sees others' R1)
+             |
+        collect rebuttals
+             |
+        combined output with debate insights
+```
+
+### Agent-Enhanced Mode (--agents)
+
+```
+User -> ask.md detects --agents flag (or NL trigger)
+             |
+        spawn N parallel Claude subagents (background)
+             |
+    +--------+--------+--------+--------+
+    |        |        |        |        |
+    v        v        v        v        v
+ Agent:   Agent:   Agent:   Agent:   ...
+ Gemini   OpenAI   Grok     Perplexity
+    |        |        |        |
+    | Each agent independently:
+    | 1. Runs provider curl script
+    | 2. Evaluates response quality
+    | 3. Retries with reformulated prompt if poor
+    | 4. Asks follow-up questions for depth
+    | 5. Returns structured analysis:
+    |    - Key recommendations
+    |    - Confidence level
+    |    - Unique perspective
+    |    - Blind spots
+    |        |        |        |
+    +--------+--------+--------+
+             |
+        orchestrator collects all analyses
+             |
+        enhanced synthesis:
+        - confidence-weighted consensus
+        - cross-provider blind spot analysis
+        - divergence with context
+             |
+        save to council-cache
+```
+
+Key difference from standard mode: subagents do meaningful analytical
+work beyond the API call, pre-digesting each response before synthesis.
+
+### Local Council Mode (--local / no providers)
+
+```
+User -> ask.md (--local, or accepts the offer when no providers found)
+             |
+        skill asks how many members (unless --roles given); local_council_roles
+        resolves that many from a diverse order (default 4, up to 8)
+             |
+        spawn one general-purpose subagent per role (background, blind to each other)
+             |
+    +--------+--------+--------+
+    |        |        |        |
+    v        v        v        v
+ Member:  Member:  Member:  Member:
+ devil    simplicity security scalability
+    |        |        |        |
+    | Each member (Claude, general-purpose subagent):
+    | - Answers the role-injected question on its own
+    | - Returns Position / Key points / Risks & blind spots / Confidence
+    |        |        |
+    +--------+--------+
+             |
+        orchestrator collects all perspectives
+             |
+        honest synthesis (angles, NOT consensus):
+        - shared starting points to pressure-test
+        - genuine tensions between roles
+        - cross-member blind spots
+             |
+        save to council-cache
+```
+
+Key difference from agent mode: members do **not** call any provider — each one
+*is* the answerer (Claude under a role). Because they share a model, the
+synthesis is framed around independent angles and blind-spot coverage, never as
+cross-vendor consensus. This is the zero-provider fallback so the plugin is
+usable on a Claude subscription alone.
+
+## File Structure
+
+```
+claude-council/
+├── .claude-plugin/
+│   └── plugin.json              # Plugin manifest
+├── .github/
+│   └── workflows/
+│       └── tests.yml            # bats on ubuntu + macos; shellcheck blocks a merge
+├── agents/
+│   └── council-advisor.md       # Proactive suggestions
+├── commands/
+│   ├── ask.md                   # Main /ask command
+│   ├── result.md                # /result — fetch/list/cancel background jobs
+│   └── status.md                # /status command
+├── config/
+│   └── roles.json               # Role definitions
+├── docs/
+│   └── ARCHITECTURE.md          # This file
+├── hooks/
+│   └── hooks.json               # Stop hook registration (stop gate)
+├── prompts/
+│   ├── role-injection.md        # {{VAR}} template for role-wrapped prompts
+│   ├── synthesis.md             # Synthesis structure + calibration rules
+│   ├── stop-review-gate.md      # Stop-gate reviewer contract
+│   └── kimi-cli-agent.md        # No-tools agent definition passed to the kimi CLI
+├── schemas/
+│   └── agent-analysis.schema.json  # Deep-execution agent reply contract
+├── scripts/
+│   ├── query-council.sh         # Main orchestrator
+│   ├── run-council.sh           # Query + format pipeline, sync and --async
+│   ├── format-output.sh         # Terminal formatter
+│   ├── check-status.sh          # Provider health check
+│   ├── stop-review-gate.sh      # Opt-in Stop hook reviewer
+│   ├── validate-analysis.sh     # Enforces the agent-analysis schema
+│   ├── release.sh               # Version bump and tagging
+│   ├── dev/
+│   │   └── demo-pane.sh         # Visual test harness for the streaming pane
+│   ├── providers/
+│   │   ├── gemini.sh            # API
+│   │   ├── openai.sh            # API
+│   │   ├── grok.sh              # API
+│   │   ├── perplexity.sh        # API
+│   │   ├── kimi.sh              # API (Moonshot)
+│   │   ├── codex.sh             # CLI (subscription auth, shadows openai)
+│   │   ├── antigravity.sh       # CLI (subscription auth, shadows gemini)
+│   │   ├── grok-cli.sh          # CLI (subscription auth, shadows grok)
+│   │   ├── kimi-cli.sh          # CLI (subscription auth, shadows kimi)
+│   │   └── ollama.sh            # Local (no key, no sibling)
+│   └── lib/
+│       ├── cache.sh             # Caching utilities
+│       ├── display.sh           # Streaming tmux pane + iTerm2 lifecycle
+│       ├── export.sh            # Markdown export
+│       ├── hash.sh              # Portable SHA-256 helper (shasum / sha256sum)
+│       ├── jobs.sh              # Background job store
+│       ├── keys.sh              # API key resolution (XAI_API_KEY ↔ GROK_API_KEY)
+│       ├── model_fallback.sh    # Fallback model per provider + TTL-cached unavailable verdicts
+│       ├── pane-watcher.sh      # Runs in the tmux pane: streams status + rendered responses
+│       ├── prompts.sh           # Template loading + {{VAR}} interpolation
+│       ├── providers.sh         # Discovery + CLI-prefers-API policy + vendor display
+│       ├── render.pl            # Dependency-free markdown renderer (perl fallback)
+│       ├── render.py            # Council-tuned Rich markdown renderer
+│       ├── retry.sh             # Retry with backoff + off-argv secret config
+│       ├── roles.sh             # Role management
+│       ├── tokens.sh            # Reasoning-model token-cap bumping
+│       └── verbosity.sh         # Shared system prompt, inline-answer guard, verbosity directives
+├── skills/
+│   ├── council-execution/
+│   │   └── SKILL.md             # Standard query execution
+│   ├── deep-execution/
+│   │   ├── SKILL.md             # Agent-enhanced execution (--agents)
+│   │   └── agent-prompt-template.md  # Subagent prompt template
+│   ├── local-council-execution/
+│   │   ├── SKILL.md             # Local Claude-only council (--local / no providers)
+│   │   └── agent-prompt-template.md  # Council-member prompt template
+│   └── provider-integration/
+│       ├── SKILL.md             # Adding providers guide
+│       └── api-patterns.md      # API integration patterns
+├── tests/
+│   ├── run_tests.sh             # Test runner
+│   ├── test_helper.bash         # Shared test utilities
+│   ├── fixtures/
+│   │   └── fake-clis.bash       # Fake codex/agy/grok/kimi/ollama binaries on PATH
+│   ├── agent-analysis.bats
+│   ├── argmax.bats              # ARG_MAX marshalling round-trip guards
+│   ├── cache.bats
+│   ├── check-status.bats
+│   ├── cli-providers.bats       # CLI providers (codex, antigravity, grok-cli)
+│   ├── display.bats
+│   ├── export.bats
+│   ├── fake-clis.bats
+│   ├── format-output.bats
+│   ├── image.bats               # Vision / --image routing + privacy guards
+│   ├── jobs.bats
+│   ├── keys.bats
+│   ├── model_fallback.bats      # Classifier, fallback pairs, verdict cache, gated real-API test
+│   ├── pane-watcher.bats
+│   ├── prompts.bats
+│   ├── providers.bats           # API provider payloads + secret hygiene
+│   ├── release.bats
+│   ├── retry.bats
+│   ├── roles.bats
+│   ├── stop-gate.bats
+│   ├── theme.bats
+│   ├── tokens.bats
+│   ├── verbosity.bats
+│   └── query-council.bats
+├── .shellcheckrc               # Points shellcheck at the sourced libs
+├── CHANGELOG.md
+├── LICENSE
+├── README.md
+└── TESTING.md
+```
+
+## Configuration Reference
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GEMINI_API_KEY` | - | Google AI Studio key |
+| `OPENAI_API_KEY` | - | OpenAI API key |
+| `XAI_API_KEY` | - | xAI API key (preferred) |
+| `GROK_API_KEY` | - | xAI API key (legacy alias; `XAI_API_KEY` wins if both set) |
+| `PERPLEXITY_API_KEY` | - | Perplexity API key |
+| `KIMI_API_KEY` | - | Moonshot/Kimi API key; the only var that makes `kimi` discoverable |
+| `MOONSHOT_API_KEY` | - | Read as a fallback by `kimi.sh`, but does not satisfy discovery |
+| `{PROVIDER}_MODEL` | varies | Model override (API providers) |
+| `CODEX_MODEL` | (unset) | Model passed to `codex exec -m`, only when set (else the codex CLI's own configured model) |
+| `ANTIGRAVITY_MODEL` | (unset) | Model passed to `agy --model`, only when set (else the model selected in the Antigravity app) |
+| `GROK_CLI_MODEL` | (unset) | Model passed to `grok -m`, only when set (else the grok CLI's own default) |
+| `KIMI_CLI_MODEL` | (unset) | Model passed to `kimi -m`, only when set (else the kimi CLI's own configured model) |
+| `OLLAMA_MODEL` | (unset) | Local model id; when unset, whichever model `ollama list` shows first |
+| `OLLAMA_HOST` | http://localhost:11434 | Ollama server, following Ollama's own convention |
+| `COUNCIL_PROVIDERS` | (unset) | Comma-separated roster queried by default, ahead of discovery; `--providers` still wins per call |
+| `COUNCIL_ARGV_LIMIT` | 24000 | Prompt length past which `antigravity` writes the question to a file and points `agy` at it, since Windows caps a command line at 32k |
+| `COUNCIL_MAX_TOKENS` | 2048 | Max response tokens (`ollama` uses a 4096 base) |
+| `COUNCIL_MAX_RETRIES` | 3 | Retry attempts |
+| `COUNCIL_RETRY_DELAY` | 1 | Initial retry delay (s) |
+| `COUNCIL_TIMEOUT` | 300 | Request timeout (s) |
+| `COUNCIL_CACHE_DIR` | .claude/council-cache | Cache location |
+| `COUNCIL_CACHE_TTL` | 3600 | Cache lifetime (s) |
+| `COUNCIL_AVAILABILITY_TTL` | 86400 | Model-unavailable verdict cache lifetime (s); `0` re-checks every query |
+| `COUNCIL_JOBS_DIR` | per-workspace under `$CLAUDE_PLUGIN_DATA` | Background job state location |
+| `COUNCIL_MAX_JOBS` | 20 | Terminal-status jobs kept before pruning |
+| `COUNCIL_PROMPTS_DIR` | prompts/ | Prompt template location |
+| `COUNCIL_DEBUG` | - | Enable debug output |
+| `COUNCIL_NO_PANE` | - | Set to `1` to disable the streaming tmux pane globally |
+| `COUNCIL_RENDERER` | auto | `perl` forces the built-in perl renderer; otherwise the pane prefers Rich when a Rich-capable Python exists (python3 with a modern rich, else `uv run --no-project --with rich`), with perl as the fallback |
+| `COUNCIL_RICH_PROBE_TIMEOUT` | 10 | Seconds before the pane-open uv probe for Rich is abandoned (guards against a cold uv cache on a dead network stalling pane opening) |
+| `COUNCIL_THEME` | auto-detected | Force pane render palette (emphasis + muted text): `light` / `dark` (else OSC 11 query; `COLORFGBG` only asserts `light`, never `dark` since it goes stale; otherwise attribute-only emphasis that inherits the foreground, and muted text keeps faint/bright-black) |
+| `COUNCIL_AUTO_CLOSE` | - | Set to `1` to auto-close the pane on completion (skip the keypress wait); used by tests/demos |
+| `COUNCIL_ATTENTION_THRESHOLD` | 2000 | iTerm2 dock-bounce threshold in ms (only triggers if total elapsed >= this) |
+| `COUNCIL_VERBOSITY` | standard | Response style: `brief` / `standard` / `detailed` (prepended to all providers' system prompts) |
+| `OPENAI_REASONING_EFFORT` | medium | Reasoning model effort |
+| `PERPLEXITY_RECENCY` | - | Search recency filter |
